@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "strapi-kapa-docs": {
+      "command": "node",
+      "args": ["/path/to/your/strapi-kapa-mcp-server/dist/index.js"],
+      "env": {
+        "KAPA_API_KEY": "your_kapa_api_key_here",
+        "KAPA_API_URL": "https://api.kapa.ai",
+        "MCP_SERVER_NAME": "strapi-kapa-docs"
+      }
+    }
+  }
+}
