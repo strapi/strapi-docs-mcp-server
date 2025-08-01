@@ -14,12 +14,16 @@ interface KapaResponse {
     snippet: string;
   }>;
   confidence: number;
+  thread_id?: string;
+  question_answer_id?: string;
+  is_uncertain?: boolean;
 }
 
 interface KapaQueryRequest {
   query: string;
   context?: string;
-  max_sources?: number;
+  integration_id?: string;
+  source_ids_include?: string[];
 }
 
 class KapaClient {
@@ -28,50 +32,148 @@ class KapaClient {
 
   constructor(apiKey: string, projectId: string, baseURL: string = 'https://api.kapa.ai') {
     this.projectId = projectId;
-    // Utiliser le format exact du GitHub Workflow qui fonctionne
+    
+    // Configuration selon la documentation officielle Kapa
     this.client = axios.create({
-      baseURL: `${baseURL}/query/v1/projects/${projectId}/chat`,
+      baseURL: baseURL,
       headers: {
-        'X-API-Key': apiKey,  // Utiliser X-API-Key comme dans le workflow
+        'X-API-KEY': apiKey,  // Format exact de la documentation
         'Content-Type': 'application/json',
+        'Accept': 'application/json',
         'User-Agent': 'Strapi-MCP-Server/1.0'
       },
-      timeout: 120000, // 2 minutes comme dans le workflow
+      timeout: 30000,
     });
   }
 
   async query(request: KapaQueryRequest): Promise<KapaResponse> {
     try {
-      const response = await this.client.post('/', {
+      // Endpoint exact selon la documentation
+      const endpoint = `/query/v1/projects/${this.projectId}/chat/`;
+      
+      // Payload selon le format officiel
+      const payload = {
         query: request.query,
-        max_sources: request.max_sources || 5,
-        user_data: {
-          source: 'mcp-server',
-          context: request.context || 'strapi-documentation'
+        // Champs optionnels
+        ...(request.integration_id && { integration_id: request.integration_id }),
+        ...(request.source_ids_include && { source_ids_include: request.source_ids_include }),
+        // Métadonnées pour identifier la source
+        user: {
+          unique_client_id: 'mcp-server-user',
+          metadata: {
+            source: 'strapi-mcp-server'
+          }
+        },
+        metadata: {
+          origin_url: 'https://docs.strapi.io'
         }
-      });
-
-      // Utiliser la structure de réponse exacte du workflow
-      return {
-        answer: response.data.answer || 'No answer available',
-        sources: response.data.relevant_sources || [],
-        confidence: response.data.confidence || 0,
       };
+
+      // Debug logs removed for MCP compatibility
+      
+      const response = await this.client.post(endpoint, payload);
+      
+      // Debug: Response received successfully
+      
+      // Adapter la réponse selon le format officiel de Kapa
+      return this.adaptKapaResponse(response.data);
+      
     } catch (error: any) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      throw new Error(`Failed to query Kapa API: ${errorMessage}`);
+      // Log to stderr only for MCP compatibility
+      console.error('Kapa API Error:', error.response?.data || error.message);
+      
+      let errorMessage = 'Failed to query Kapa API';
+      
+      if (error.response) {
+        const status = error.response.status;
+        const data = error.response.data;
+        
+        switch (status) {
+          case 401:
+            errorMessage = 'Invalid API key. Please check your KAPA_API_KEY.';
+            break;
+          case 403:
+            errorMessage = 'Access forbidden. Please check your project permissions.';
+            break;
+          case 404:
+            errorMessage = 'Project not found. Please check your KAPA_PROJECT_ID.';
+            break;
+          case 422:
+            errorMessage = `Invalid request: ${data?.detail || 'Please check your request parameters.'}`;
+            break;
+          case 429:
+            errorMessage = 'Rate limit exceeded. Please try again later.';
+            break;
+          default:
+            errorMessage = `API error (${status}): ${data?.detail || data?.message || 'Unknown error'}`;
+        }
+      } else if (error.request) {
+        errorMessage = `Network error: Unable to reach Kapa API at ${error.config?.baseURL}`;
+      }
+      
+      throw new Error(errorMessage);
     }
   }
 
+  private adaptKapaResponse(data: any): KapaResponse {
+    // Format de réponse selon la documentation Kapa
+    const sources = (data.relevant_sources || []).map((source: any) => ({
+      title: source.title || source.name || 'Documentation',
+      url: source.source_url || source.url || '#',
+      snippet: source.snippet || source.content || source.excerpt || ''
+    }));
+
+    return {
+      answer: data.answer || 'No answer available',
+      sources: sources,
+      confidence: data.confidence || (data.is_uncertain ? 0.5 : 0.8),
+      thread_id: data.thread_id,
+      question_answer_id: data.question_answer_id,
+      is_uncertain: data.is_uncertain || false
+    };
+  }
+
   async searchDocumentation(query: string, context?: string): Promise<KapaResponse> {
+    // Si un contexte est fourni, l'inclure dans la requête
     const enhancedQuery = context 
-      ? `${query}\n\nContext: ${context}`
+      ? `Context: ${context}\n\nQuestion: ${query}`
       : query;
 
     return this.query({
       query: enhancedQuery,
-      max_sources: 5,
     });
+  }
+
+  // Méthode pour tester la connexion avec une requête simple
+  async testConnection(): Promise<{ success: boolean; message: string; details?: any }> {
+    try {
+      const response = await this.query({
+        query: "What is Strapi? Please provide a brief answer."
+      });
+      
+      if (response.answer && response.answer.length > 10) {
+        return {
+          success: true,
+          message: "Connection successful",
+          details: {
+            answer_length: response.answer.length,
+            sources_count: response.sources.length,
+            thread_id: response.thread_id,
+            is_uncertain: response.is_uncertain
+          }
+        };
+      } else {
+        return {
+          success: false,
+          message: "Connection established but received empty response"
+        };
+      }
+    } catch (error) {
+      return {
+        success: false,
+        message: error instanceof Error ? error.message : String(error)
+      };
+    }
   }
 }
 
@@ -80,6 +182,7 @@ class StrapiKapaMCPServer {
   private kapaClient: KapaClient;
 
   constructor() {
+    // Validation des variables d'environnement
     if (!process.env.KAPA_API_KEY) {
       throw new Error('KAPA_API_KEY environment variable is required');
     }
@@ -107,6 +210,20 @@ class StrapiKapaMCPServer {
 
     this.setupToolHandlers();
     this.setupErrorHandling();
+    this.performStartupTest();
+  }
+
+  private async performStartupTest() {
+    try {
+      const result = await this.kapaClient.testConnection();
+      if (result.success) {
+        console.error('✅ Kapa API connection successful'); // Use stderr for MCP
+      } else {
+        console.error('❌ Kapa API connection failed:', result.message);
+      }
+    } catch (error) {
+      console.error('❌ Startup test error:', error);
+    }
   }
 
   private setupToolHandlers(): void {
@@ -121,7 +238,7 @@ class StrapiKapaMCPServer {
               properties: {
                 query: {
                   type: 'string',
-                  description: 'The question or topic you want to search in Strapi documentation',
+                  description: 'The question or topic you want to search in Strapi documentation (max 15000 characters)',
                 },
                 context: {
                   type: 'string',
@@ -129,6 +246,15 @@ class StrapiKapaMCPServer {
                 },
               },
               required: ['query'],
+            },
+          },
+          {
+            name: 'test_kapa_connection',
+            description: 'Test the connection to Kapa API to verify configuration and API key validity.',
+            inputSchema: {
+              type: 'object',
+              properties: {},
+              required: [],
             },
           },
           {
@@ -183,6 +309,9 @@ class StrapiKapaMCPServer {
           case 'query_strapi_docs':
             return await this.handleQueryStrapiDocs(args as any);
           
+          case 'test_kapa_connection':
+            return await this.handleTestConnection();
+          
           case 'get_strapi_best_practices':
             return await this.handleGetBestPractices(args as any);
           
@@ -198,7 +327,7 @@ class StrapiKapaMCPServer {
           content: [
             {
               type: 'text',
-              text: `Error: ${errorMessage}`,
+              text: `❌ Error: ${errorMessage}`,
             },
           ],
           isError: true,
@@ -207,21 +336,77 @@ class StrapiKapaMCPServer {
     });
   }
 
+  private async handleTestConnection() {
+    try {
+      const result = await this.kapaClient.testConnection();
+      
+      const statusIcon = result.success ? '✅' : '❌';
+      let responseText = `${statusIcon} Kapa API Connection Test\n\n`;
+      responseText += `Status: ${result.success ? 'SUCCESS' : 'FAILED'}\n`;
+      responseText += `Message: ${result.message}\n\n`;
+
+      if (result.details) {
+        responseText += `Details:\n`;
+        responseText += `- Answer length: ${result.details.answer_length} characters\n`;
+        responseText += `- Sources found: ${result.details.sources_count}\n`;
+        responseText += `- Thread ID: ${result.details.thread_id}\n`;
+        responseText += `- Uncertain: ${result.details.is_uncertain ? 'Yes' : 'No'}\n\n`;
+      }
+
+      responseText += `Configuration:\n`;
+      responseText += `- API URL: ${process.env.KAPA_API_URL || 'https://api.kapa.ai'}\n`;
+      responseText += `- Project ID: ${process.env.KAPA_PROJECT_ID}\n`;
+      responseText += `- API Key: ${process.env.KAPA_API_KEY ? '***' + process.env.KAPA_API_KEY.slice(-4) : 'Not set'}`;
+      
+      return {
+        content: [
+          {
+            type: 'text',
+            text: responseText,
+          },
+        ],
+      };
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `❌ Connection test failed: ${errorMessage}`,
+          },
+        ],
+      };
+    }
+  }
+
   private async handleQueryStrapiDocs(args: { query: string; context?: string }) {
     const response = await this.kapaClient.searchDocumentation(args.query, args.context);
     
-    let sourcesText = '';
+    let responseText = response.answer;
+    
+    // Ajouter des informations sur l'incertitude
+    if (response.is_uncertain) {
+      responseText += '\n\n⚠️ *Note: The AI is uncertain about this answer. Please verify the information.*';
+    }
+    
+    // Ajouter les sources si disponibles
     if (response.sources && response.sources.length > 0) {
-      const formattedSources = response.sources
-        .filter((source: any) => source.source_url && source.source_url.startsWith('http'))
-        .map((source: any, index: number) => {
+      const validSources = response.sources.filter(source => 
+        source.url && 
+        (source.url.startsWith('http') || source.url.startsWith('https')) &&
+        source.url !== '#'
+      );
+      
+      if (validSources.length > 0) {
+        responseText += '\n\n**📚 Sources:**\n';
+        validSources.forEach((source, index) => {
           let title = source.title || 'Documentation';
           
-          // Handle pipe-separated title|subtitle format like in the workflow
+          // Nettoyer le titre s'il contient des séparateurs
           if (title.includes('|')) {
             const parts = title.split('|');
             const pageTitle = parts[0].trim();
-            const sectionTitle = parts[1].trim();
+            const sectionTitle = parts[1]?.trim();
             
             if (sectionTitle && sectionTitle !== pageTitle) {
               title = `${pageTitle} - ${sectionTitle}`;
@@ -230,19 +415,21 @@ class StrapiKapaMCPServer {
             }
           }
           
-          return `${index + 1}. [${title}](${source.source_url})`;
+          responseText += `${index + 1}. [${title}](${source.url})\n`;
         });
-      
-      if (formattedSources.length > 0) {
-        sourcesText = `\n\n**Sources:**\n${formattedSources.join('\n')}`;
       }
+    }
+    
+    // Ajouter l'ID du thread pour un éventuel suivi
+    if (response.thread_id) {
+      responseText += `\n\n*Thread ID: ${response.thread_id}*`;
     }
 
     return {
       content: [
         {
           type: 'text',
-          text: `${response.answer}${sourcesText}`,
+          text: responseText,
         },
       ],
     };
@@ -251,21 +438,30 @@ class StrapiKapaMCPServer {
   private async handleGetBestPractices(args: { topic: string; project_type?: string }) {
     const query = `What are the best practices for ${args.topic} in Strapi${
       args.project_type ? ` for ${args.project_type} projects` : ''
-    }? Please provide detailed recommendations and examples.`;
+    }? Please provide detailed recommendations, examples, and common pitfalls to avoid.`;
 
-    const response = await this.kapaClient.searchDocumentation(query);
+    const response = await this.kapaClient.searchDocumentation(query, 'best practices');
     
-    const sourcesText = response.sources.length > 0
-      ? `\n\n**References:**\n${response.sources.map((source, index) => 
+    let responseText = `**🎯 Best Practices for ${args.topic}**\n\n${response.answer}`;
+    
+    if (response.is_uncertain) {
+      responseText += '\n\n⚠️ *Note: Please verify these recommendations with the official Strapi documentation.*';
+    }
+    
+    if (response.sources.length > 0) {
+      const validSources = response.sources.filter(s => s.url.startsWith('http'));
+      if (validSources.length > 0) {
+        responseText += `\n\n**📖 References:**\n${validSources.map((source, index) => 
           `${index + 1}. [${source.title}](${source.url})`
-        ).join('\n')}`
-      : '';
+        ).join('\n')}`;
+      }
+    }
 
     return {
       content: [
         {
           type: 'text',
-          text: `**Best Practices for ${args.topic}:**\n\n${response.answer}${sourcesText}`,
+          text: responseText,
         },
       ],
     };
@@ -276,31 +472,43 @@ class StrapiKapaMCPServer {
     error_message?: string; 
     strapi_version?: string; 
   }) {
-    let query = `I'm having an issue with Strapi: ${args.issue_description}`;
+    let query = `I'm experiencing this issue with Strapi: ${args.issue_description}`;
     
     if (args.error_message) {
-      query += `\n\nError message: ${args.error_message}`;
+      query += `\n\nSpecific error message: "${args.error_message}"`;
     }
     
     if (args.strapi_version) {
-      query += `\n\nStrapi version: ${args.strapi_version}`;
+      query += `\n\nI'm using Strapi version: ${args.strapi_version}`;
     }
     
-    query += '\n\nHow can I fix this? Please provide step-by-step solutions.';
+    query += '\n\nHow can I resolve this issue? Please provide step-by-step troubleshooting instructions and possible causes.';
 
-    const response = await this.kapaClient.searchDocumentation(query);
+    const response = await this.kapaClient.searchDocumentation(
+      query, 
+      'troubleshooting and problem solving'
+    );
     
-    const sourcesText = response.sources.length > 0
-      ? `\n\n**Helpful Resources:**\n${response.sources.map((source, index) => 
+    let responseText = `**🔧 Troubleshooting: ${args.issue_description}**\n\n${response.answer}`;
+    
+    if (response.is_uncertain) {
+      responseText += '\n\n⚠️ *If this solution doesn\'t work, consider checking the Strapi community forum or GitHub issues.*';
+    }
+    
+    if (response.sources.length > 0) {
+      const validSources = response.sources.filter(s => s.url.startsWith('http'));
+      if (validSources.length > 0) {
+        responseText += `\n\n**🆘 Helpful Resources:**\n${validSources.map((source, index) => 
           `${index + 1}. [${source.title}](${source.url})`
-        ).join('\n')}`
-      : '';
+        ).join('\n')}`;
+      }
+    }
 
     return {
       content: [
         {
           type: 'text',
-          text: `**Troubleshooting Solution:**\n\n${response.answer}${sourcesText}`,
+          text: responseText,
         },
       ],
     };
@@ -308,12 +516,23 @@ class StrapiKapaMCPServer {
 
   private setupErrorHandling(): void {
     this.server.onerror = (error: any) => {
-      process.stderr.write(`[MCP Error] ${error.message}\n`);
+      console.error(`[MCP Error] ${error.message || error}`);
     };
 
     process.on('SIGINT', async () => {
+      console.error('\n🛑 Shutting down MCP server...');
       await this.server.close();
       process.exit(0);
+    });
+
+    process.on('uncaughtException', (error) => {
+      console.error('Uncaught Exception:', error);
+      process.exit(1);
+    });
+
+    process.on('unhandledRejection', (reason, promise) => {
+      console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+      process.exit(1);
     });
   }
 
@@ -321,15 +540,30 @@ class StrapiKapaMCPServer {
     try {
       const transport = new StdioServerTransport();
       await this.server.connect(transport);
+      console.error('🚀 Strapi Kapa MCP Server started successfully'); // Use stderr for MCP
     } catch (error: any) {
-      process.stderr.write(`[MCP Server Error] ${error.message}\n`);
+      console.error(`[MCP Server Error] ${error.message || error}`);
       process.exit(1);
     }
   }
 }
 
+// Validation des variables d'environnement au démarrage
+function validateEnvironment() {
+  const required = ['KAPA_API_KEY', 'KAPA_PROJECT_ID'];
+  const missing = required.filter(key => !process.env[key]);
+  
+  if (missing.length > 0) {
+    console.error(`❌ Missing required environment variables: ${missing.join(', ')}`);
+    console.error('Please check your .env file and ensure all required variables are set.');
+    process.exit(1);
+  }
+}
+
+// Démarrage du serveur
+validateEnvironment();
 const server = new StrapiKapaMCPServer();
 server.start().catch((error) => {
-  process.stderr.write(`[Startup Error] ${error.message}\n`);
+  console.error(`[Startup Error] ${error.message || error}`);
   process.exit(1);
 });
