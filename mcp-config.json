@@ -4,7 +4,8 @@
       "command": "node",
       "args": ["/path/to/your/strapi-docs-mcp-server/dist/index.js"],
       "env": {
-        "KAPA_API_KEY": "your_kapa_api_key_here",
+        "KAPA_API_KEY": "your-api-key",
+        "KAPA_PROJECT_ID": "your-project-id",
         "KAPA_API_URL": "https://api.kapa.ai",
         "MCP_SERVER_NAME": "strapi-docs"
       }
